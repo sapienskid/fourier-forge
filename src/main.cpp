@@ -37,6 +37,22 @@ glm::vec4 HSVtoRGB(float h, float s, float v, float a) {
     return glm::vec4(1, 1, 1, a);
 }
 
+// --- Helper: Grid Generator ---
+std::vector<glm::vec2> GenerateGrid(float size, float step) {
+    std::vector<glm::vec2> lines;
+    // Vertical lines
+    for (float x = -size; x <= size; x += step) {
+        lines.push_back(glm::vec2(x, -size));
+        lines.push_back(glm::vec2(x, size));
+    }
+    // Horizontal lines
+    for (float y = -size; y <= size; y += step) {
+        lines.push_back(glm::vec2(-size, y));
+        lines.push_back(glm::vec2(size, y));
+    }
+    return lines;
+}
+
 // --- Helper: Screen Quad ---
 class ScreenQuad {
     GLuint vao, vbo;
@@ -147,7 +163,6 @@ void AsyncLoad(std::string path) {
     statusMessage = "Parsing SVG...";
     loadingFuture = std::async(std::launch::async, [path]() {
         LoadedData data;
-        // UPDATED: Increased to 10000 for ultra-smooth paths
         data.points = SVGParser::LoadAndSample(path, 10000); 
         if (!data.points.empty()) {
             data.epis = FourierTransform::ComputeDFT(data.points);
@@ -182,11 +197,15 @@ int main(int argc, char* argv[]) {
 
     Shader circleShader(vShaderCircle, fShaderCircle);
     Shader lineShader(vShaderLine, fShaderLine);
-    // Increased buffer sizes to handle 10k vectors
+    
     CircleBatch circleBatch(20000);
     LineBatch armBatch(20000);
     TrailRenderer trailRenderer(100000); 
     TrailRenderer pathRenderer(50000);
+    
+    // GRID SETUP
+    LineBatch gridBatch(5000); // 200x200 lines is plenty
+    std::vector<glm::vec2> gridLines = GenerateGrid(5000.0f, 100.0f);
 
     std::vector<Epicycle> epicycles;
     std::vector<glm::vec2> pathPoints;
@@ -206,15 +225,28 @@ int main(int argc, char* argv[]) {
     bool autoFollow = false;
     bool isDragging = false;
 
-    // Visual Settings
-    bool showCircles = true, showArms = true, showTrail = true, showRef = false;
+    // --- DESIGN / VISUAL STATE ---
+    // Visibility Toggles
+    bool showCircles = true, showArms = true, showTrail = true, showRef = false, showGrid = true;
+    
+    // Math Config
     int activeCircles = 10000; 
+    
+    // Colors
     bool rainbowMode = false;
-    int trailLength = 0;
     float hue = 0.0f;
     glm::vec4 bgColor = glm::vec4(0.05f, 0.05f, 0.1f, 1.0f);
     glm::vec4 inkColor = glm::vec4(0.0f, 1.0f, 1.0f, 1.0f);
+    glm::vec4 gridColor = glm::vec4(1.0f, 1.0f, 1.0f, 0.1f); // Subtle default
+    
+    // Dimensions & Opacities
     float strokeWidth = 2.0f;
+    float circleOpacity = 0.2f;
+    float armOpacity = 0.5f;
+    float trailOpacity = 1.0f;
+    float refOpacity = 0.3f;
+    
+    int trailLength = 0;
 
     // Cinematic State
     bool cinematicMode = false;
@@ -258,7 +290,7 @@ int main(int argc, char* argv[]) {
                     activeCircles = (int)epicycles.size();
                     statusMessage = "Loaded " + std::to_string(epicycles.size()) + " cycles.";
                     
-                    // Auto-reset view logic
+                    // Reset to Blueprint Mode
                     showRef = true; 
                     showCircles = false; 
                     showArms = false; 
@@ -279,6 +311,8 @@ int main(int argc, char* argv[]) {
             if (hue > 1.0f) hue -= 1.0f;
             inkColor = HSVtoRGB(hue, 1.0f, 1.0f, 1.0f);
         }
+        // Update Opacity for dynamic Ink Color
+        inkColor.a = trailOpacity;
 
         // --- Cinematic State Machine ---
         if (cinematicMode && !epicycles.empty()) {
@@ -318,13 +352,12 @@ int main(int argc, char* argv[]) {
                         time -= 1.0f; 
                         if (trailLength == 0) trail.clear(); 
                         
-                        // CINEMATIC FINISH TRIGGER
                         if (cinematicMode && recording) {
                             recording = false;
                             cinematicMode = false;
-                            exporter.reset(); // Saves file
-                            paused = true;    // Stop animation
-                            time = 0.999f;    // Show finished drawing
+                            exporter.reset(); 
+                            paused = true;    
+                            time = 0.999f;    
                             zoom = 1.0f;      
                             pan = glm::vec2(0,0);
                             statusMessage = "Cinematic Shot Saved Successfully!";
@@ -350,7 +383,6 @@ int main(int argc, char* argv[]) {
                 }
             }
             
-            // Build Geometry
             std::complex<double> currentPos(0,0);
             for(int i=0; i<activeCircles; ++i) {
                 const auto& epi = epicycles[i];
@@ -379,25 +411,41 @@ int main(int argc, char* argv[]) {
         glm::mat4 proj = glm::ortho(-wView/2, wView/2, -hView/2, hView/2);
         glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(pan, 0.0f));
 
+        // 0. Grid (Behind everything)
+        if (showGrid) {
+            glLineWidth(1.0f);
+            lineShader.Use();
+            lineShader.SetMat4("uProjection", proj);
+            lineShader.SetMat4("uView", view);
+            gridBatch.Draw(gridLines, lineShader, gridColor);
+        }
+
+        // 1. Ghost Reference
         if (showRef && !pathPoints.empty()) {
             glLineWidth(1.0f);
             lineShader.Use(); lineShader.SetMat4("uProjection", proj); lineShader.SetMat4("uView", view);
-            pathRenderer.UpdateAndDraw(pathPoints, lineShader, glm::vec4(0.2, 0.2, 0.2, 0.5));
+            pathRenderer.UpdateAndDraw(pathPoints, lineShader, glm::vec4(0.2, 0.2, 0.2, refOpacity));
         }
+
+        // 2. Ink Trail
         if (showTrail && !trail.empty()) {
             glLineWidth(strokeWidth);
             lineShader.Use(); lineShader.SetMat4("uProjection", proj); lineShader.SetMat4("uView", view);
             trailRenderer.UpdateAndDraw(trail, lineShader, inkColor);
         }
+
+        // 3. Epicycles
         if (showCircles && !currentCenters.empty()) {
             circleShader.Use(); circleShader.SetMat4("uProjection", proj); circleShader.SetMat4("uView", view);
-            circleShader.SetVec4("uColor", 1.0, 1.0, 1.0, 0.2);
+            circleShader.SetVec4("uColor", 1.0, 1.0, 1.0, circleOpacity);
             circleBatch.Draw(currentCenters, currentRadii, circleShader);
         }
+        
+        // 4. Arms
         if (showArms && !armSegments.empty()) {
             glLineWidth(1.0f);
             lineShader.Use();
-            armBatch.Draw(armSegments, lineShader, glm::vec4(1.0, 1.0, 1.0, 0.5));
+            armBatch.Draw(armSegments, lineShader, glm::vec4(1.0, 1.0, 1.0, armOpacity));
         }
 
         if (recording && exporter) {
@@ -417,7 +465,6 @@ int main(int argc, char* argv[]) {
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // Loading Modal
         if (isLoading) {
             if (!ImGui::IsPopupOpen("Loading")) ImGui::OpenPopup("Loading");
         }
@@ -428,164 +475,123 @@ int main(int argc, char* argv[]) {
             ImGui::EndPopup();
         }
 
-        // Main Control Panel
         ImGui::Begin("Fourier Forge", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
         
-        // Header / Load
         if (ImGui::Button(" Load SVG ")) {
             IGFD::FileDialogConfig config; config.path = "."; config.countSelectionMax = 1; config.flags = ImGuiFileDialogFlags_Modal;
             IGFD::FileDialog::Instance()->OpenDialog("ChooseFile", "Select SVG", ".svg", config);
         }
         ImGui::SameLine();
         ImGui::TextDisabled("%s", statusMessage.c_str());
-        
         ImGui::Separator();
 
-        // PLAYBACK CONTROLS
+        // PLAYBACK
         ImGui::Text("Playback");
         if (ImGui::Button(paused ? "  PLAY  " : " PAUSE ")) paused = !paused;
         ImGui::SameLine();
-        
-        // UPDATED RESET LOGIC
         if (ImGui::Button(" RESET ")) { 
             time = 0.0f; 
             trail.clear(); 
             paused = true;
-            
-            // "Show ghost outline, nothing others"
-            showRef = true;
-            showCircles = false;
-            showArms = false;
-            showTrail = false;
+            // Blueprint Mode
+            showRef = true; showCircles = false; showArms = false; showTrail = false;
         }
-        
-        // Progress Bar
         ImGui::SameLine();
-        ImGui::PushItemWidth(200);
+        ImGui::PushItemWidth(150);
         ImGui::SliderFloat("##Progress", &time, 0.0f, 1.0f, "%.2f");
         ImGui::PopItemWidth();
-        
         ImGui::SliderFloat("Speed", &speed, 0.0f, 2.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
 
-        // TABS FOR SETTINGS
+        // TABS
         if (ImGui::BeginTabBar("SettingsTabs")) {
             
-            // TAB: EXPORT
-            if (ImGui::BeginTabItem("Export")) {
-                ImGui::Dummy(ImVec2(0.0f, 8.0f)); // Spacing
-                ImGui::TextColored(ImVec4(1, 0.8f, 0, 1), "Cinematic Auto-Render");
-                ImGui::TextWrapped("Automatically zooms in, tracks the pen, and saves the video when the drawing completes.");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
+            // --- TAB: VISUALS ---
+            if (ImGui::BeginTabItem("Visuals")) {
+                ImGui::Dummy(ImVec2(0, 5));
                 
+                if (ImGui::CollapsingHeader("Canvas", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::ColorEdit3("Background", (float*)&bgColor);
+                    ImGui::Checkbox("Show Grid", &showGrid);
+                    ImGui::SameLine(); ImGui::ColorEdit4("Grid Color", (float*)&gridColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+                }
+
+                if (ImGui::CollapsingHeader("Drawing", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Show Trail", &showTrail);
+                    ImGui::SameLine(); 
+                    ImGui::ColorEdit3("Ink", (float*)&inkColor, ImGuiColorEditFlags_NoInputs);
+                    ImGui::SameLine(); ImGui::Checkbox("Rainbow", &rainbowMode);
+                    
+                    ImGui::SliderFloat("Opacity##Trail", &trailOpacity, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Brush Size", &strokeWidth, 1.0f, 10.0f);
+                    
+                    ImGui::Text("Mode:"); ImGui::SameLine();
+                    if(ImGui::RadioButton("Infinite", trailLength == 0)) trailLength = 0;
+                    ImGui::SameLine();
+                    if(ImGui::RadioButton("Snake", trailLength > 0)) trailLength = 1000;
+                }
+
+                if (ImGui::CollapsingHeader("Mechanism", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Circles", &showCircles);
+                    ImGui::SameLine(); ImGui::SliderFloat("Alpha##Circ", &circleOpacity, 0.0f, 1.0f);
+                    
+                    ImGui::Checkbox("Arms", &showArms);
+                    ImGui::SameLine(); ImGui::SliderFloat("Alpha##Arms", &armOpacity, 0.0f, 1.0f);
+
+                    ImGui::Checkbox("Ghost", &showRef);
+                    ImGui::SameLine(); ImGui::SliderFloat("Alpha##Ref", &refOpacity, 0.0f, 1.0f);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // --- TAB: CAMERA ---
+            if (ImGui::BeginTabItem("Camera")) {
+                ImGui::Dummy(ImVec2(0, 5));
+                ImGui::SliderFloat("Zoom", &zoom, 0.1f, 50.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+                ImGui::Checkbox("Auto-Follow Pen", &autoFollow);
+                if(ImGui::Button("Reset View")) { zoom=1.0f; pan=glm::vec2(0,0); autoFollow=false; }
+                
+                ImGui::Separator();
+                int maxE = (int)epicycles.size();
+                ImGui::SliderInt("Vectors", &activeCircles, 1, maxE);
+                ImGui::EndTabItem();
+            }
+
+            // --- TAB: EXPORT ---
+            if (ImGui::BeginTabItem("Export")) {
+                ImGui::Dummy(ImVec2(0, 5));
+                ImGui::TextColored(ImVec4(1, 0.8f, 0, 1), "Cinematic Auto-Render");
                 if (ImGui::Button("START CINEMATIC SHOT", ImVec2(-1, 40))) {
                     if (!epicycles.empty()) {
                         cinematicMode = true;
                         recording = true;
                         exporter = std::make_unique<VideoExporter>(RENDER_W, RENDER_H, 60);
-                        time = 0.0f;
-                        trail.clear();
-                        paused = false;
-                        autoFollow = true;
-                        trailLength = 0; 
+                        time = 0.0f; trail.clear(); paused = false; autoFollow = true; trailLength = 0; 
                         
-                        // FORCE ENABLE VISUALS FOR RECORDING
-                        showRef = false;
-                        showCircles = true;
-                        showArms = true;
-                        showTrail = true;
+                        // Force Enable Drawing
+                        showRef = false; showCircles = true; showArms = true; showTrail = true;
+                        // Ensure visibility
+                        circleOpacity = 0.2f; armOpacity = 0.5f; trailOpacity = 1.0f;
                     }
                 }
-                ImGui::Dummy(ImVec2(0.0f, 5.0f));
-
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
-
-                ImGui::Text("Manual Recording");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
+                ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                 if (ImGui::Button(recording && !cinematicMode ? "STOP RECORDING" : "START MANUAL REC", ImVec2(-1, 30))) {
                     recording = !recording;
                     if (recording) {
                         exporter = std::make_unique<VideoExporter>(RENDER_W, RENDER_H, 60);
-                        time = 0.0f; trail.clear();
-                        
-                        // Manual record usually implies we want to see the drawing
-                        showTrail = true;
+                        time = 0.0f; trail.clear(); showTrail = true;
                     } else exporter.reset();
                 }
-                if (recording) {
-                    ImGui::TextColored(ImVec4(1, 0, 0, 1), "RECORDING IN PROGRESS...");
-                }
-                ImGui::Dummy(ImVec2(0.0f, 5.0f));
+                if (recording) ImGui::TextColored(ImVec4(1, 0, 0, 1), "RECORDING...");
                 ImGui::EndTabItem();
             }
-
-            // TAB: VISUALS
-            if (ImGui::BeginTabItem("Visuals")) {
-                ImGui::Dummy(ImVec2(0.0f, 8.0f)); // Spacing
-                ImGui::Text("Visibility");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
-                ImGui::Checkbox("Circles", &showCircles);
-                ImGui::SameLine(); ImGui::Checkbox("Arms", &showArms);
-                ImGui::SameLine(); ImGui::Checkbox("Trail", &showTrail);
-                ImGui::Checkbox("Ghost Reference", &showRef);
-                ImGui::Dummy(ImVec2(0.0f, 8.0f));
-
-                ImGui::Spacing();
-                ImGui::Text("Colors & Style");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
-                ImGui::ColorEdit3("Ink Color", (float*)&inkColor);
-                ImGui::Checkbox("Rainbow Ink", &rainbowMode);
-                ImGui::SliderFloat("Stroke Width", &strokeWidth, 1.0f, 10.0f);
-                ImGui::ColorEdit3("Background", (float*)&bgColor);
-                ImGui::Dummy(ImVec2(0.0f, 8.0f));
-                
-                ImGui::Spacing();
-                ImGui::Text("Trail Mode");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
-                if(ImGui::RadioButton("Infinite", trailLength == 0)) trailLength = 0;
-                ImGui::SameLine();
-                if(ImGui::RadioButton("Snake", trailLength > 0)) trailLength = 1000;
-                if(trailLength > 0) ImGui::SliderInt("Tail Len", &trailLength, 100, 5000);
-                ImGui::Dummy(ImVec2(0.0f, 5.0f));
-
-                ImGui::EndTabItem();
-            }
-
-            // TAB: CAMERA & MATH
-            if (ImGui::BeginTabItem("Camera/Math")) {
-                ImGui::Dummy(ImVec2(0.0f, 8.0f)); // Spacing
-                ImGui::Text("Camera");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
-                ImGui::SliderFloat("Zoom", &zoom, 0.1f, 50.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-                ImGui::Checkbox("Auto-Follow Pen", &autoFollow);
-                if(ImGui::Button("Reset View")) { zoom=1.0f; pan=glm::vec2(0,0); autoFollow=false; }
-                ImGui::Dummy(ImVec2(0.0f, 8.0f));
-
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
-
-                ImGui::Text("Approximation");
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
-                ImGui::Dummy(ImVec2(0.0f, 3.0f));
-                int maxE = (int)epicycles.size();
-                ImGui::SliderInt("Vectors", &activeCircles, 1, maxE);
-                ImGui::TextDisabled("Using %d of %d available vectors", activeCircles, maxE);
-                ImGui::Dummy(ImVec2(0.0f, 5.0f));
-                ImGui::EndTabItem();
-            }
-
             ImGui::EndTabBar();
         }
 
-        // File Dialog Logic
-        ImVec2 minSize(800, 600);
-        ImVec2 maxSize(FLT_MAX, FLT_MAX);
+        // File Dialog
+        ImVec2 minSize(800, 600); ImVec2 maxSize(FLT_MAX, FLT_MAX);
         if (IGFD::FileDialog::Instance()->Display("ChooseFile", ImGuiWindowFlags_NoCollapse, minSize, maxSize)) {
             if (IGFD::FileDialog::Instance()->IsOk()) {
-                std::string path = IGFD::FileDialog::Instance()->GetFilePathName();
-                AsyncLoad(path);
+                AsyncLoad(IGFD::FileDialog::Instance()->GetFilePathName());
             }
             IGFD::FileDialog::Instance()->Close();
         }
